@@ -6,6 +6,7 @@ const { join: joinPath } = require("path");
 
 const inputs = require("./inputs");
 const { OctopusClient } = require("./octopus");
+const tokenMatch = /\W?([A-Z]+-\d+)[\]/-]/g;
 
 /**
  * Discover the previous release's SHA by querying the Octopus Deploy API.
@@ -143,15 +144,52 @@ async function getCommits(github, base) {
       base,
       head: context.sha,
     });
+    const tickets = await getTicketReferences(github);
+
     // eslint-disable-next-line no-restricted-syntax
     for await (const response of github.paginate.iterator(request)) {
-      commits = commits.concat(response.data.commits);
+      for (const commit of response.data.commits) {
+        if (tickets.length && !tokenMatch.test(commit.commit.message)) {
+          commit.commit.message += " [" + tickets.join("][") + "]";
+        }
+        commits.push(commit);
+      }
     }
   } catch (e) {
     core.warning(`Failed to compare commits: ${e.message}`);
   }
 
   return commits;
+}
+
+async function getTicketReferences(github) {
+  if (!context.issue.number) return [];
+
+  let response = await github.rest.pulls.get({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    pull_number: context.issue.number,
+  });
+
+  let ticketMatches = [];
+  const titleMatches = tokenMatch.exec(response.data.title).map((x) => x[1]);
+  const bodyMatches = tokenMatch.exec(response.data.body).map((x) => x[1]);
+  const branchMatches = tokenMatch.exec(response.data.head.ref).map((x) => x[1]);
+  ticketMatches = ticketMatches.concat(titleMatches, bodyMatches, branchMatches);
+
+  let comments = await github.rest.issues.listComments({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    issue_number: context.issue.number,
+  });
+  for await (const page of github.paginate.iterator(comments)) {
+    for (const comment of page.data) {
+      const matches = tokenMatch.exec(comment.body).map((x) => x[1]);
+      ticketMatches = ticketMatches.concat(matches);
+    }
+  }
+  ticketMatches = fp.uniq(ticketMatches);
+  return ticketMatches;
 }
 
 async function run() {
