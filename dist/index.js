@@ -10330,9 +10330,10 @@ async function getPreviousRef(github, octopus) {
  * Get the commits since a base commit.
  * @param {GitHub} github an authenticated octokit REST client
  * @param {string} base the SHA of the base commit
+ * @param {string[]} tickets the lit of tickets to add to the commit message
  * @returns {Promise<array>} an array of commit objects
  */
-async function getCommits(github, base) {
+async function getCommits(github, base, tickets) {
   if (!base) return [];
 
   // compare commits with pagination
@@ -10344,12 +10345,11 @@ async function getCommits(github, base) {
       base,
       head: context.sha,
     });
-    const tickets = await getTicketReferences(github);
 
     // eslint-disable-next-line no-restricted-syntax
     for await (const response of github.paginate.iterator(request)) {
       for (const commit of response.data.commits) {
-        if (tickets.length && !tokenMatch.test(commit.commit.message)) {
+        if (tickets && tickets.length && !tokenMatch.test(commit.commit.message)) {
           commit.commit.message += " [" + tickets.join("][") + "]";
         }
         commits.push(commit);
@@ -10363,43 +10363,67 @@ async function getCommits(github, base) {
 }
 
 async function getTicketReferences(github) {
-  if (!context.issue.number) return [];
-
-  let response = await github.rest.pulls.get({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    pull_number: context.issue.number,
-  });
+  if (!context.issue.number) return { tickets: [], pullRequest: null };
+  let response;
+  try {
+    response = await github.rest.pulls.get({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      pull_number: context.issue.number,
+    });
+  } catch (e) {
+    core.warning(`Failed to fetch pull request ${context.issue.number}: ${e.message}`);
+    return { tickets: [], pullRequest: null };
+  }
 
   let ticketMatches = [];
-  const titleMatches = tokenMatch.exec(response.data.title).map((x) => x[1]);
-  const bodyMatches = tokenMatch.exec(response.data.body).map((x) => x[1]);
-  const branchMatches = tokenMatch.exec(response.data.head.ref).map((x) => x[1]);
+  const titleMatches = Array.from((response.data.title || "").matchAll(tokenMatch), (x) => x[1]);
+  const bodyMatches = Array.from((response.data.body || "").matchAll(tokenMatch), (x) => x[1]);
+  const branchMatches = Array.from(
+    (response.data.head.ref || "").matchAll(tokenMatch),
+    (x) => x[1]
+  );
   ticketMatches = ticketMatches.concat(titleMatches, bodyMatches, branchMatches);
 
-  let comments = await github.rest.issues.listComments({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    issue_number: context.issue.number,
-  });
-  for await (const page of github.paginate.iterator(comments)) {
-    for (const comment of page.data) {
-      const matches = tokenMatch.exec(comment.body).map((x) => x[1]);
-      ticketMatches = ticketMatches.concat(matches);
+  try {
+    let comments = await github.rest.issues.listComments({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      issue_number: context.issue.number,
+    });
+    for await (const page of github.paginate.iterator(comments)) {
+      for (const comment of page.data) {
+        const matches = Array.from(comment.body.matchAll(tokenMatch), (x) => x[1]);
+        ticketMatches = ticketMatches.concat(matches);
+      }
     }
+  } catch (e) {
+    core.warning(`Failed to fetch any comments for pull request ${context.issue.number}.`);
   }
   ticketMatches = fp.uniq(ticketMatches);
-  return ticketMatches;
+  return { tickets: ticketMatches, event: response.data };
 }
 
 async function run() {
   try {
     const github = getOctokit(inputs.githubToken);
     const octopus = new OctopusClient(inputs.octopusApiKey, inputs.octopusServer);
-    const previousRef = await getPreviousRef(github, octopus);
+    let tickets = [];
+    let previousRef = null;
+    if (context.eventName === "pull_request") {
+      ({
+        tickets: tickets,
+        event: {
+          base: { sha: previousRef },
+        },
+      } = await getTicketReferences(github));
+      core.info(`Detected head @ ${previousRef}`);
+    } else {
+      previousRef = await getPreviousRef(github, octopus);
+    }
 
     // compare the previous release to the current tag
-    const commits = await getCommits(github, previousRef);
+    const commits = await getCommits(github, previousRef, tickets);
     core.info(`Collected ${commits.length} commits`);
 
     // detect branch name
@@ -10415,7 +10439,7 @@ async function run() {
       BuildEnvironment: "GitHub Actions",
       BuildNumber: runId.toString(),
       BuildUrl: `${repoUri}/actions/runs/${runId}`,
-      Branch: branch,
+      Branch: branch || process.env.GITHUB_HEAD_REF,
       VcsType: "Git",
       VcsRoot: `${repoUri}.git`,
       VcsCommitNumber: context.sha,
